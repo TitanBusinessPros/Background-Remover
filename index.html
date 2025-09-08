@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>U²-Net BG Remover — Hosted ONNX (Hugging Face)</title>
+
+<!-- ONNX Runtime Web -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+
+<style>
+  body{font-family:Inter,system-ui,Arial,sans-serif;background:#0b1220;color:#e6eef8;margin:0;padding:26px}
+  .wrap{max-width:1100px;margin:0 auto;display:grid;grid-template-columns:320px 1fr;gap:18px}
+  .card{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border-radius:12px;padding:14px;border:1px solid rgba(255,255,255,0.03)}
+  h1{margin:0 0 8px 0;font-size:18px}
+  .muted{color:#98adc4;font-size:13px}
+  .uploader{margin-top:12px;border:2px dashed rgba(255,255,255,0.04);border-radius:10px;padding:12px;text-align:center;cursor:pointer}
+  .uploader.drag{background:rgba(124,58,237,0.06)}
+  canvas{max-width:100%;height:auto;border-radius:8px;background:transparent;display:block;margin:8px 0}
+  .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+  .btn{background:linear-gradient(90deg,#7c3aed,#06b6d4);border:none;color:#fff;padding:8px 12px;border-radius:8px;cursor:pointer}
+  .ghost{background:transparent;border:1px solid rgba(255,255,255,0.06)}
+  label.small{font-size:13px;color:#98adc4;display:block;margin-top:10px}
+  input[type=file]{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>U²-Net BG Remover</h1>
+    <div class="muted">Model hosted on Hugging Face — runs locally in your browser</div>
+
+    <div id="uploader" class="uploader" title="Click or drop">
+      <div style="font-size:22px">📷</div>
+      <div style="font-weight:700;margin-top:6px">Click or drop image</div>
+      <div class="muted" style="margin-top:6px">No files needed in your repo. Uses remote ONNX.</div>
+      <input id="fileInput" type="file" accept="image/*">
+    </div>
+
+    <div class="controls">
+      <button id="processBtn" class="btn" disabled>Process (U²-Net)</button>
+      <button id="fallbackBtn" class="btn ghost">Fallback: BodyPix (people)</button>
+      <button id="downloadBtn" class="btn ghost" disabled>Download PNG</button>
+      <button id="resetBtn" class="btn ghost">Reset</button>
+    </div>
+
+    <label class="small">Mask blur <span id="blurVal">6</span></label>
+    <input id="blurRange" type="range" min="0" max="24" value="6">
+
+    <label class="small">Threshold <span id="thVal">0.35</span></label>
+    <input id="thRange" type="range" min="0" max="1" step="0.01" value="0.35">
+
+    <div style="margin-top:10px" class="muted">Status: <span id="status">Loading ONNX runtime…</span></div>
+    <div style="margin-top:8px" class="muted">Model URL: <span id="modelUrl">Hugging Face (public)</span></div>
+  </div>
+
+  <div>
+    <div class="card">
+      <div style="font-weight:700;margin-bottom:8px">Editor</div>
+      <canvas id="workCanvas"></canvas>
+    </div>
+
+    <div class="card" style="margin-top:12px">
+      <div style="font-weight:700;margin-bottom:8px">Output (transparent)</div>
+      <canvas id="outCanvas"></canvas>
+    </div>
+  </div>
+</div>
+
+<script>
+/* MODEL URL (Hugging Face public host) */
+const MODEL_URL = "https://huggingface.co/martintomov/comfy/resolve/main/rembg/u2netp.onnx";
+
+/* UI */
+const fileInput = document.getElementById('fileInput');
+const uploader = document.getElementById('uploader');
+const processBtn = document.getElementById('processBtn');
+const fallbackBtn = document.getElementById('fallbackBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const resetBtn = document.getElementById('resetBtn');
+const statusEl = document.getElementById('status');
+
+const workCanvas = document.getElementById('workCanvas');
+const outCanvas = document.getElementById('outCanvas');
+const workCtx = workCanvas.getContext('2d');
+const outCtx = outCanvas.getContext('2d');
+
+const blurRange = document.getElementById('blurRange');
+const thRange = document.getElementById('thRange');
+const blurVal = document.getElementById('blurVal');
+const thVal = document.getElementById('thVal');
+
+let session = null, originalImage = null, imageLoaded = false, scale = 1;
+
+/* Prevent default nav for drops */
+['dragenter','dragover','dragleave','drop'].forEach(e => {
+  document.addEventListener(e, ev => { ev.preventDefault(); ev.stopPropagation(); });
+});
+
+/* Drag/drop */
+uploader.addEventListener('click', ()=> fileInput.click());
+uploader.addEventListener('dragover', ()=> uploader.classList.add('drag'));
+uploader.addEventListener('dragleave', ()=> uploader.classList.remove('drag'));
+uploader.addEventListener('drop', (ev)=> {
+  uploader.classList.remove('drag');
+  if (ev.dataTransfer.files && ev.dataTransfer.files[0]) handleFile(ev.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', (e)=> { if (e.target.files[0]) handleFile(e.target.files[0]); });
+
+/* Slider UI */
+blurRange.addEventListener('input', ()=> blurVal.textContent = blurRange.value);
+thRange.addEventListener('input', ()=> thVal.textContent = thRange.value);
+
+/* Load ONNX runtime + model */
+async function loadSession(){
+  try {
+    statusEl.textContent = 'Loading model from CDN…';
+    // Try WebGL then WASM
+    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ['webgl','wasm'] });
+    statusEl.textContent = 'Model loaded (U²-Netp)';
+    processBtn.disabled = false;
+  } catch (err) {
+    console.error('ONNX load error:', err);
+    statusEl.textContent = 'Failed to load ONNX model — see console';
+    // we still let user try BodyPix fallback
+    fallbackBtn.disabled = false;
+  }
+}
+loadSession();
+
+/* File handling */
+function fitCanvasToImage(img){
+  const maxDim = 1200;
+  const s = Math.min(1, maxDim / Math.max(img.width, img.height));
+  scale = s;
+  workCanvas.width = Math.round(img.width * s);
+  workCanvas.height = Math.round(img.height * s);
+  outCanvas.width = workCanvas.width;
+  outCanvas.height = workCanvas.height;
+}
+function drawOriginal(){
+  workCtx.clearRect(0,0,workCanvas.width,workCanvas.height);
+  workCtx.drawImage(originalImage, 0, 0, workCanvas.width, workCanvas.height);
+  outCtx.clearRect(0,0,outCanvas.width,outCanvas.height);
+  outCtx.drawImage(workCanvas, 0, 0);
+  downloadBtn.disabled = true;
+}
+
+function handleFile(file){
+  if (!file || !file.type.startsWith('image/')) { alert('Please choose an image file'); return; }
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = ()=> {
+    originalImage = img;
+    imageLoaded = true;
+    fitCanvasToImage(img);
+    drawOriginal();
+    statusEl.textContent = 'Image loaded';
+  };
+  img.src = url;
+}
+
+/* Preprocess to square model input with padding; returns Float32Array NCHW and pad info */
+function preprocess(canvas, inputSize=320){
+  const tmp = document.createElement('canvas');
+  tmp.width = inputSize; tmp.height = inputSize;
+  const tctx = tmp.getContext('2d');
+  tctx.fillStyle = 'black'; tctx.fillRect(0,0,inputSize,inputSize);
+
+  const sw = canvas.width, sh = canvas.height;
+  const ratio = Math.min(inputSize / sw, inputSize / sh);
+  const dw = Math.round(sw * ratio), dh = Math.round(sh * ratio);
+  const dx = Math.floor((inputSize - dw)/2), dy = Math.floor((inputSize - dh)/2);
+  tctx.drawImage(canvas, 0,0, sw, sh, dx, dy, dw, dh);
+  const imgData = tctx.getImageData(0,0,inputSize,inputSize).data;
+
+  const floatData = new Float32Array(1 * 3 * inputSize * inputSize);
+  let p = 0;
+  for (let c = 0; c < 3; c++){
+    for (let y = 0; y < inputSize; y++){
+      for (let x = 0; x < inputSize; x++){
+        const i = (y * inputSize + x) * 4;
+        const r = imgData[i]/255, g = imgData[i+1]/255, b = imgData[i+2]/255;
+        floatData[p++] = (c===0? r : (c===1? g : b));
+      }
+    }
+  }
+  return {tensorData: floatData, pad:{dx,dy,dw,dh}};
+}
+
+/* Run ONNX and get mask canvas aligned to workCanvas */
+async function runONNX(){
+  if (!session) throw new Error('Model not loaded');
+  const INPUT_SIZE = 320;
+  const {tensorData, pad} = preprocess(workCanvas, INPUT_SIZE);
+  const inputName = session.inputNames[0];
+  const feeds = {};
+  feeds[inputName] = new ort.Tensor('float32', tensorData, [1,3,INPUT_SIZE,INPUT_SIZE]);
+  const t0 = performance.now();
+  const results = await session.run(feeds);
+  const t1 = performance.now();
+  const outName = session.outputNames[0];
+  const outTensor = results[outName]; // shape [1,1,H,W] often
+  const outData = outTensor.data; // float32
+  // build mask ImageData for INPUT_SIZE
+  const maskCanvas = document.createElement('canvas');
+  maskCanvas.width = INPUT_SIZE; maskCanvas.height = INPUT_SIZE;
+  const mctx = maskCanvas.getContext('2d');
+  const maskImg = mctx.createImageData(INPUT_SIZE, INPUT_SIZE);
+  for (let i=0; i<INPUT_SIZE*INPUT_SIZE; i++){
+    const v = Math.max(0, Math.min(1, outData[i])); // clamp
+    const a = Math.round(v * 255);
+    const idx = i*4;
+    maskImg.data[idx] = 0; maskImg.data[idx+1] = 0; maskImg.data[idx+2] = 0; maskImg.data[idx+3] = a;
+  }
+  mctx.putImageData(maskImg, 0, 0);
+
+  // draw only the central region corresponding to the scaled image into a mask sized like workCanvas
+  const resizedMask = document.createElement('canvas');
+  resizedMask.width = workCanvas.width; resizedMask.height = workCanvas.height;
+  const rctx = resizedMask.getContext('2d');
+
+  const sx = pad.dx, sy = pad.dy, sw = pad.dw, sh = pad.dh;
+  rctx.drawImage(maskCanvas, sx, sy, sw, sh, 0, 0, workCanvas.width, workCanvas.height);
+  return {maskCanvas: resizedMask, timeMs: Math.round(t1-t0)};
+}
+
+/* Composite original with mask alpha and optional blur */
+function composite(maskCanvas){
+  const w = workCanvas.width, h = workCanvas.height;
+  const tmp = document.createElement('canvas'); tmp.width = w; tmp.height = h;
+  const tctx = tmp.getContext('2d');
+  tctx.drawImage(workCanvas, 0, 0);
+  const imgData = tctx.getImageData(0,0,w,h);
+  const mdata = maskCanvas.getContext('2d').getImageData(0,0,w,h).data;
+  for (let i=0,j=0;i<imgData.data.length;i+=4,j+=4){
+    imgData.data[i+3] = mdata[j+3]; // set alpha from mask
+  }
+  tctx.putImageData(imgData, 0, 0);
+
+  const blurPx = parseInt(blurRange.value,10);
+  if (blurPx > 0){
+    const blurred = document.createElement('canvas'); blurred.width = w; blurred.height = h;
+    const bctx = blurred.getContext('2d'); bctx.filter = `blur(${blurPx}px)`; bctx.drawImage(tmp,0,0);
+    return blurred;
+  }
+  return tmp;
+}
+
+/* Process button */
+processBtn.addEventListener('click', async ()=>{
+  if (!imageLoaded) { alert('Upload an image first'); return; }
+  processBtn.disabled = true;
+  statusEl.textContent = 'Running model...';
+  try {
+    const {maskCanvas, timeMs} = await runONNX();
+    const result = composite(maskCanvas);
+    outCtx.clearRect(0,0,outCanvas.width,outCanvas.height);
+    outCtx.drawImage(result, 0, 0);
+    statusEl.textContent = `Done — ${timeMs} ms`;
+    downloadBtn.disabled = false;
+  } catch (err) {
+    console.error('Inference error:', err);
+    statusEl.textContent = 'Inference failed — check console';
+    alert('Model inference failed — see console (possible CORS or model mismatch). Click BodyPix fallback to try people-only segmentation.');
+  } finally {
+    processBtn.disabled = false;
+  }
+});
+
+/* BodyPix fallback (people-only) */
+fallbackBtn.addEventListener('click', async ()=>{
+  statusEl.textContent = 'Loading BodyPix...';
+  fallbackBtn.disabled = true;
+  try {
+    if (!window.bodyPix){
+      await new Promise((res, rej)=>{
+        const s1 = document.createElement('script'); s1.src='https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0/dist/tf.min.js';
+        s1.onload = ()=> { const s2 = document.createElement('script'); s2.src='https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.0/dist/body-pix.min.js'; s2.onload=res; s2.onerror=rej; document.head.appendChild(s2); };
+        s1.onerror = rej; document.head.appendChild(s1);
+      });
+    }
+    const net = await bodyPix.load({architecture:'MobileNetV1', multiplier:0.75});
+    statusEl.textContent = 'BodyPix ready — segmenting...';
+    const seg = await net.segmentPerson(workCanvas, { internalResolution:'medium', segmentationThreshold: parseFloat(thRange.value) });
+    const mask = bodyPix.toMask(seg, {r:0,g:0,b:0,a:255}, {r:0,g:0,b:0,a:0});
+    const maskCanvas = document.createElement('canvas'); maskCanvas.width = workCanvas.width; maskCanvas.height = workCanvas.height;
+    maskCanvas.getContext('2d').putImageData(mask, 0, 0);
+    const result = composite(maskCanvas);
+    outCtx.clearRect(0,0,outCanvas.width,outCanvas.height);
+    outCtx.drawImage(result, 0, 0);
+    downloadBtn.disabled = false;
+    statusEl.textContent = 'BodyPix done';
+  } catch (err){
+    console.error('BodyPix fallback error', err);
+    statusEl.textContent = 'BodyPix failed';
+    alert('BodyPix fallback failed — check console');
+  } finally {
+    fallbackBtn.disabled = false;
+  }
+});
+
+/* Download */
+downloadBtn.addEventListener('click', ()=> {
+  outCanvas.toBlob(blob=>{
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'no-bg.png';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, 'image/png');
+});
+
+/* Reset */
+resetBtn.addEventListener('click', ()=> {
+  if (!imageLoaded) return;
+  drawOriginal();
+  statusEl.textContent = 'Reset';
+  downloadBtn.disabled = true;
+});
+
+/* File loader */
+function handleFile(file){
+  if (!file || !file.type.startsWith('image/')) { alert('Please upload an image'); return; }
+  const url = URL.createObjectURL(file);
+  const img = new Image();
+  img.onload = ()=> {
+    originalImage = img; imageLoaded = true;
+    fitCanvasToImage(img); drawOriginal();
+    statusEl.textContent = 'Image loaded';
+  };
+  img.src = url;
+}
+</script>
+</body>
+</html>
